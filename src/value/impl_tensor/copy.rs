@@ -356,7 +356,13 @@ impl<'s> IdentitySessionHandle<'s> {
 			}
 		};
 
-		identity_session.binding.bind_input("input", &src)?;
+		// `bind_input` would clone a borrowed `src`, and cloning re-enters this function while `SESSIONS` is locked.
+		// Aliasing is sound here: the handle keeps `src` alive and clears the binding on drop.
+		unsafe {
+			identity_session
+				.binding
+				.bind_input_inner("input".to_string(), alloc::sync::Arc::clone(&(*src).inner))
+		}?;
 
 		Ok(Self {
 			inner: unsafe { core::mem::transmute::<&mut IdentitySession, &'static mut IdentitySession>(identity_session) },
@@ -388,11 +394,70 @@ impl Drop for IdentitySessionHandle<'_> {
 
 #[cfg(test)]
 mod tests {
+	use core::time::Duration;
+	use std::{sync::mpsc, thread};
+
+	use super::IDENTITY_MODEL;
 	use crate::{
 		memory::{AllocationDevice, Allocator},
+		session::Session,
 		test_util::test_env,
-		value::Tensor
+		value::{Tensor, TensorRef, TensorRefMut}
 	};
+
+	/// Runs `f` on another thread and fails the test if it doesn't finish in time, so a deadlock fails instead of
+	/// hanging the test binary.
+	fn finishes<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+		let (tx, rx) = mpsc::channel();
+		thread::spawn(move || {
+			let _ = tx.send(f());
+		});
+		rx.recv_timeout(Duration::from_secs(30)).expect("operation did not finish (deadlock?)")
+	}
+
+	fn identity_f32_session() -> crate::Result<Session> {
+		let mut model_bytes = IDENTITY_MODEL.to_vec();
+		model_bytes[544] = ort_sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT as u8;
+		model_bytes[604] = ort_sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT as u8;
+		Session::builder(test_env())?.commit_from_memory(&model_bytes)
+	}
+
+	#[test]
+	fn test_clone_borrowed_tensor() -> crate::Result<()> {
+		let _env = test_env();
+		finishes(|| -> crate::Result<()> {
+			let data = vec![1.0_f32, 2.0, 3.0, 4.0];
+			let view = TensorRef::from_array_view(([4_usize], &data[..]))?;
+			let clone = (*view).clone();
+			assert_eq!(view.extract_tensor(), clone.extract_tensor());
+			assert_ne!(view.data_ptr(), clone.data_ptr());
+
+			let moved = view.to(AllocationDevice::CPU, 0)?;
+			assert_eq!(view.extract_tensor(), moved.extract_tensor());
+			Ok(())
+		})
+	}
+
+	#[test]
+	fn test_bind_borrowed_input() -> crate::Result<()> {
+		let _env = test_env();
+		finishes(|| -> crate::Result<()> {
+			let mut session = identity_f32_session()?;
+			let mut binding = session.create_binding()?;
+			binding.bind_output_to_device("output", &session.allocator().memory_info())?;
+
+			let mut data = vec![1.0_f32, 2.0, 3.0, 4.0];
+			for frame in 0..3 {
+				data[0] = frame as f32 * 10.0;
+				let view = TensorRefMut::from_array_view_mut(([4_usize], &mut data[..]))?;
+				binding.bind_input("input", &view)?;
+				let outputs = session.run_binding(&binding)?;
+				let (_, output) = outputs["output"].try_extract_tensor::<f32>()?;
+				assert_eq!(output, [frame as f32 * 10.0, 2.0, 3.0, 4.0]);
+			}
+			Ok(())
+		})
+	}
 
 	#[test]
 	fn test_clone_tensor() -> crate::Result<()> {

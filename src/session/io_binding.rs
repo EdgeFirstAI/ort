@@ -159,12 +159,20 @@ impl IoBinding {
 			Arc::clone(&value.inner)
 		};
 
+		unsafe { self.bind_input_inner(name, value_inner) }
+	}
+
+	/// Binds `value` as is, without the copy [`IoBinding::bind_input`] makes of borrowed tensors.
+	///
+	/// # Safety
+	/// If `value` borrows its data, the data must stay valid until this input is re-bound or cleared.
+	pub(crate) unsafe fn bind_input_inner(&mut self, name: String, value: Arc<ValueInner>) -> Result<()> {
 		let ptr = self.ptr_mut();
 		with_cstr(name.as_bytes(), &|name| {
-			ortsys![unsafe BindInput(ptr, name.as_ptr(), value_inner.ptr())?];
+			ortsys![unsafe BindInput(ptr, name.as_ptr(), value.ptr())?];
 			Ok(())
 		})?;
-		self.held_inputs.insert(name, value_inner);
+		self.held_inputs.insert(name, value);
 		Ok(())
 	}
 
